@@ -1,0 +1,40 @@
+name: Pre-PR upstream baseline CIFuzz
+
+on:
+  push:
+    branches: [prepr/opacity-baseline-a79ff]
+
+permissions:
+  contents: read
+
+jobs:
+  baseline-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Build upstream baseline fuzzers
+        uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
+        with:
+          oss-fuzz-project-name: assimp
+          language: c++
+          dry-run: false
+          project-src-path: .
+          keep-unaffected-fuzz-targets: true
+      - name: Run the same five-minute batch on unmodified source
+        uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
+        with:
+          oss-fuzz-project-name: assimp
+          language: c++
+          dry-run: false
+          mode: batch
+          fuzz-seconds: 300
+      - name: Preserve baseline crash reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: baseline-fuzz-artifacts
+          path: out/artifacts
+          if-no-files-found: warn
