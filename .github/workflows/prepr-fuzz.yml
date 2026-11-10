@@ -1,0 +1,33 @@
+name: Pre-PR CIFuzz batch validation
+
+on:
+  push:
+    branches: [prepr/opacity-9dc3aab]
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Build fuzzers from this checkout
+        uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
+        with:
+          oss-fuzz-project-name: assimp
+          language: c++
+          dry-run: false
+          project-src-path: .
+          keep-unaffected-fuzz-targets: true
+      - name: Run all built fuzzers for five minutes
+        uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
+        with:
+          oss-fuzz-project-name: assimp
+          language: c++
+          dry-run: false
+          mode: batch
+          fuzz-seconds: 300
