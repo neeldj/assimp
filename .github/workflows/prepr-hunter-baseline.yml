@@ -1,0 +1,37 @@
+name: Pre-PR upstream baseline Windows static Hunter
+
+on:
+  push:
+    branches: [prepr/opacity-hunter-baseline-a79ff]
+
+permissions:
+  contents: read
+
+jobs:
+  static-hunter:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CC: cl.exe
+      CXX: cl.exe
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Hunter-compatible CMake
+        run: python -m pip install --target .ci-cmake "cmake>=3.22,<4"
+      - name: Configure and build actual static Hunter configuration
+        shell: pwsh
+        run: |
+          $cmake = Join-Path $PWD '.ci-cmake/cmake/data/bin/cmake.exe'
+          & $cmake --version
+          & $cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DASSIMP_HUNTER_ENABLED=ON -DASSIMP_BUILD_TESTS=ON -DASSIMP_WARNINGS_AS_ERRORS=ON -DASSIMP_BUILD_ASSIMP_TOOLS=OFF -DASSIMP_BUILD_USE_CCACHE=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $cmake --build build --parallel 2
+          exit $LASTEXITCODE
+      - name: Run unit suite with upstream Hunter exclusions
+        shell: pwsh
+        run: |
+          & ./build/bin/unit.exe '--gtest_filter=-utOpenGEXImportExport.Importissue1340_EmptyCameraObject:utColladaZaeImportExport.importBlenFromFileTest' --gtest_output=json:hunter-results.json
+          exit $LASTEXITCODE
