@@ -1,0 +1,77 @@
+name: Pre-PR exact glTF v1 upstream leak replay
+
+on:
+  push:
+    branches: [prepr/opacity-gltf1-baseline-a79ff]
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce-upstream-leak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch and verify the exact original fuzz input
+        run: |
+          python3 - <<'PY'
+          import hashlib, io, pathlib, urllib.request, zipfile
+          target = 'f0f9da6639522e25eedaceb880681a301271e34e'
+          url = 'https://storage.googleapis.com/assimp-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/assimp_fuzzer_gltf/public.zip'
+          with urllib.request.urlopen(url) as response:
+              archive_data = response.read(50 * 1024 * 1024 + 1)
+          assert len(archive_data) <= 50 * 1024 * 1024
+          with zipfile.ZipFile(io.BytesIO(archive_data)) as archive:
+              names = [entry for entry in archive.infolist() if pathlib.PurePosixPath(entry.filename).name == target]
+              assert len(names) == 1 and names[0].file_size <= 1024 * 1024
+              data = archive.read(names[0])
+          assert hashlib.sha1(data).hexdigest() == target
+          pathlib.Path('exact-input.bin').write_bytes(data)
+          print('Verified original input:', target, len(data), 'bytes')
+          PY
+      - name: Build the original importer with AddressSanitizer
+        run: |
+          cmake -S . -B replay-build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS=OFF -DASSIMP_ASAN=ON -DASSIMP_NO_EXPORT=ON -DASSIMP_BUILD_TESTS=OFF -DASSIMP_WARNINGS_AS_ERRORS=ON -DASSIMP_BUILD_ASSIMP_TOOLS=OFF -DASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT=OFF -DASSIMP_BUILD_GLTF_IMPORTER=ON -DASSIMP_BUILD_ZLIB=ON -DASSIMP_BUILD_USE_CCACHE=OFF
+          cmake --build replay-build --target assimp --parallel 3
+          cat > replay-main.cpp <<'CPP'
+          #include <cstddef>
+          #include <cstdint>
+          #include <fstream>
+          #include <iterator>
+          #include <vector>
+          extern "C" int LLVMFuzzerTestOneInput(const uint8_t *, size_t);
+          int main(int argc, char **argv) {
+              if (argc != 2) return 2;
+              std::ifstream input(argv[1], std::ios::binary);
+              if (!input) return 3;
+              std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+              return LLVMFuzzerTestOneInput(bytes.data(), bytes.size());
+          }
+          CPP
+          library=$(find replay-build/lib -maxdepth 1 -name 'libassimp*.a' -print -quit)
+          zlib=$(find replay-build/contrib/zlib -maxdepth 1 -name 'libzlibstatic*.a' -print -quit)
+          test -n "$library" && test -n "$zlib"
+          clang++ -std=c++17 -g -fsanitize=address -fno-omit-frame-pointer -Iinclude -Ireplay-build/include fuzz/assimp_fuzzer_gltf.cc replay-main.cpp "$library" "$zlib" -lpthread -ldl -o replay-gltf1
+      - name: Confirm the same leak exists without the opacity patch
+        run: |
+          set +e
+          ASAN_OPTIONS=detect_leaks=1 ./replay-gltf1 exact-input.bin > replay.log 2>&1
+          replay_exit=$?
+          set -e
+          cat replay.log
+          echo "Original-source replay exit: $replay_exit"
+          test "$replay_exit" -ne 0
+          grep -q 'ERROR: LeakSanitizer' replay.log
+          grep -q 'glTF::LazyDict<glTF::Scene>::Get' replay.log
+          grep -q 'glTF::Asset::Load' replay.log
+          echo 'Confirmed: the exact input leaks in the same upstream glTF v1 importer path.'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: exact-gltf1-upstream-replay
+          path: replay.log
+          if-no-files-found: warn
