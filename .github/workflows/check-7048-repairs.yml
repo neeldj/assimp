@@ -1,0 +1,128 @@
+name: Verify Assimp 7048 repairs
+on:
+  push:
+    branches: [validation/7048-repairs]
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}-build-and-test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [ubuntu-latest-g++, macos-latest-clang++, windows-latest-cl.exe, windows-latest-clang.exe, windows-arm64-cl.exe, ubuntu-latest-clang++]
+        # For Windows msvc, for Linux and macOS let's use the clang compiler, use gcc for Linux.
+        include:
+          - name: windows-latest-clang.exe
+            os: windows-latest
+            cxx: clang++.exe
+            cc: clang.exe
+          - name: windows-latest-cl.exe
+            os: windows-latest
+            cxx: cl.exe
+            cc: cl.exe
+          - name: windows-arm64-cl.exe
+            os: windows-11-arm
+            arch: arm64
+            cxx: cl.exe
+            cc: cl.exe
+          - name: windows-hunter-latest-cl.exe
+            os: windows-latest
+            cxx: cl.exe
+            cc: cl.exe
+          - name: ubuntu-latest-clang++
+            os: ubuntu-latest
+            cxx: clang++
+            cc: clang
+          - name: macos-latest-clang++
+            os: macos-latest
+            cxx: clang++
+            cc: clang
+          - name: ubuntu-latest-g++
+            os: ubuntu-latest
+            cxx: g++
+            cc: gcc
+
+    steps:
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+
+    - uses: actions/checkout@v7
+      with:
+          submodules: true
+
+    - uses: lukka/get-cmake@latest
+
+    - uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.arch || 'x64' }}
+
+    # The Windows image may ship an older LLVM than the MSVC standard library
+    # supports. Pin a compatible official release and put it first on PATH.
+    - name: Install LLVM for Windows Clang
+      if: matrix.name == 'windows-latest-clang.exe'
+      shell: pwsh
+      run: |
+        $installer = Join-Path $env:RUNNER_TEMP 'LLVM-22.1.8-win64.exe'
+        $llvmDir = Join-Path $env:RUNNER_TEMP 'LLVM-22.1.8'
+        Invoke-WebRequest -Uri 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-win64.exe' -OutFile $installer
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash -ne '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c') { throw 'LLVM installer checksum mismatch' }
+        $install = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$llvmDir" -Wait -PassThru
+        if ($install.ExitCode -ne 0) { throw "LLVM installer failed: $($install.ExitCode)" }
+        $llvmBin = Join-Path $llvmDir 'bin'
+        & (Join-Path $llvmBin 'clang++.exe') --version
+        if ($LASTEXITCODE -ne 0) { throw 'Installed Clang failed to start' }
+        $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Cache DX SDK
+      id: dxcache
+      # The legacy DirectX SDK only ships x86/x64 libraries, so skip it on ARM64.
+      if: matrix.os == 'windows-latest'
+      uses: actions/cache@v6
+      with:
+        path: '${{ github.workspace }}/DX_SDK'
+        key: ${{ runner.os }}-DX_SDK
+        restore-keys: |
+          ${{ runner.os }}-DX_SDK
+
+    - name: Download DXSetup
+      if: contains(matrix.name, 'windows-latest-cl.exe') && steps.dxcache.outputs.cache-hit != 'true'
+      run: |
+        curl -s -o DXSDK_Jun10.exe --location https://download.microsoft.com/download/A/E/7/AE743F1F-632B-4809-87A9-AA1BB3458E31/DXSDK_Jun10.exe
+        cmd.exe /c start /wait .\DXSDK_Jun10.exe /U /O /F /S /P "${{ github.workspace }}\DX_SDK"
+
+    - name: Set Windows specific CMake arguments
+      if: contains(matrix.name, 'windows-latest-cl.exe')
+      id: windows_extra_cmake_args
+      run: echo "args=-DASSIMP_BUILD_ASSIMP_TOOLS=1 -DASSIMP_BUILD_ASSIMP_VIEW=1" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Set Hunter specific CMake arguments
+      if: contains(matrix.name, 'hunter')
+      id: hunter_extra_cmake_args
+      run: echo "args=-DBUILD_SHARED_LIBS=OFF -DASSIMP_HUNTER_ENABLED=ON -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/cmake/polly/${{ matrix.toolchain }}.cmake" >> $GITHUB_OUTPUT
+
+    - name: configure and build
+      uses: lukka/run-cmake@v3
+      env:
+        DXSDK_DIR: '${{ github.workspace }}/DX_SDK'
+        CC: ${{ matrix.cc }}
+        CXX: ${{ matrix.cxx }}
+
+      with:
+        cmakeListsOrSettingsJson: CMakeListsTxtAdvanced
+        cmakeListsTxtPath: '${{ github.workspace }}/CMakeLists.txt'
+        cmakeAppendedArgs: '-GNinja -DCMAKE_BUILD_TYPE=Release ${{ steps.windows_extra_cmake_args.outputs.args }} ${{ steps.hunter_extra_cmake_args.outputs.args }}'
+        buildWithCMakeArgs: '--parallel 24 -v'
+        buildDirectory: '${{ github.workspace }}/build/'
+
+    - name: Exclude certain tests in Hunter specific builds
+      if: contains(matrix.name, 'hunter')
+      id: hunter_extra_test_args
+      run: echo "args=--gtest_filter=-utOpenGEXImportExport.Importissue1340_EmptyCameraObject:utColladaZaeImportExport.importBlenFromFileTest" >> $GITHUB_OUTPUT
+
+    - name: test
+      run: cd build/bin && ./unit ${{ steps.hunter_extra_test_args.outputs.args }}
+      shell: bash
